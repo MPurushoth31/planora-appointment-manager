@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { isGoogleSheetsConfigured, loadAppointmentsFromSheet, saveAppointmentsToSheet } from "../googleSheets";
 
 const STORAGE_KEY = "appointment-planner-v2";
 const PRIORITIES = [
@@ -240,6 +241,8 @@ export default function Home() {
   const [modalAppointment, setModalAppointment] = useState(null);
   const [isCreating, setIsCreating] = useState(false);
   const [notice, setNotice] = useState("");
+  const [cloudStatus, setCloudStatus] = useState(isGoogleSheetsConfigured() ? "connecting" : "local");
+  const [cloudReady, setCloudReady] = useState(false);
   const importRef = useRef(null);
   const today = todayString();
 
@@ -251,6 +254,72 @@ export default function Home() {
       setNotice("Browser storage is full or unavailable. Export a backup and free up space.");
     }
   }, [appointments]);
+
+  // Load the shared Google Sheet once on startup. If the sheet is empty but this
+  // browser already has appointments, migrate that local list to the sheet.
+  useEffect(() => {
+    if (!isGoogleSheetsConfigured()) return undefined;
+    let active = true;
+
+    const connectToGoogleSheets = async () => {
+      try {
+        const remoteAppointments = await loadAppointmentsFromSheet();
+        if (!active) return;
+
+        const localAppointments = getInitialAppointments();
+        if (remoteAppointments.length === 0 && localAppointments.length > 0) {
+          await saveAppointmentsToSheet(localAppointments);
+          if (!active) return;
+          setAppointments(localAppointments);
+          setCloudStatus("connected");
+          setCloudReady(true);
+          setNotice(`Copied ${localAppointments.length} existing appointment(s) to Google Sheets.`);
+          return;
+        }
+
+        setAppointments(remoteAppointments);
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(remoteAppointments));
+        } catch (storageError) {
+          console.warn("Could not refresh the local appointment cache:", storageError);
+        }
+        setCloudStatus("connected");
+        setCloudReady(true);
+        setNotice(remoteAppointments.length
+          ? `Loaded ${remoteAppointments.length} appointment(s) from Google Sheets.`
+          : "Google Sheets connected. New appointments will be saved there.");
+      } catch (error) {
+        console.error("Google Sheets connection failed:", error);
+        if (!active) return;
+        setCloudStatus("error");
+        setNotice("Google Sheets could not be reached. Your browser copy is still available.");
+      }
+    };
+
+    connectToGoogleSheets();
+    return () => { active = false; };
+  }, []);
+
+  // Save the full list to the sheet after each change. Writes are serialized and
+  // verified by reading the sheet back before showing the connected status.
+  useEffect(() => {
+    if (!cloudReady || !isGoogleSheetsConfigured()) return undefined;
+    let active = true;
+    setCloudStatus("saving");
+    saveAppointmentsToSheet(appointments)
+      .then(() => {
+        if (active) setCloudStatus("connected");
+      })
+      .catch((error) => {
+        console.error("Google Sheets sync failed:", error);
+        if (active) {
+          setCloudStatus("error");
+          setNotice("Google Sheets sync failed. Your browser copy is still saved; check the backend setup.");
+        }
+      });
+    return () => { active = false; };
+  }, [appointments, cloudReady]);
+
 
   useEffect(() => {
     if (!notice) return undefined;
@@ -392,7 +461,19 @@ export default function Home() {
           <span className="brand-copy"><strong>Planora</strong><small>YOUR PERSONAL PLANNER</small></span>
         </a>
         <div className="topbar-actions">
-          <span className="local-badge"><span /> Saved on this device</span>
+          <span className={`local-badge cloud-badge cloud-${cloudStatus}`} title={
+            cloudStatus === "connected" ? "Appointment changes are synchronised with Google Sheets." :
+            cloudStatus === "saving" ? "Saving your appointment changes to Google Sheets." :
+            cloudStatus === "connecting" ? "Connecting to the Google Sheets backend." :
+            cloudStatus === "error" ? "Google Sheets is not syncing. The browser copy remains available." :
+            "Google Sheets is not configured. Appointments are stored only in this browser."
+          }><span className="cloud-status-dot" />{
+            cloudStatus === "connected" ? "Synced to Google Sheets" :
+            cloudStatus === "saving" ? "Saving to Google Sheets…" :
+            cloudStatus === "connecting" ? "Connecting to Sheets…" :
+            cloudStatus === "error" ? "Google Sheets sync issue" :
+            "Browser-only storage"
+          }</span>
           <button className="button button-primary top-add" onClick={() => { setModalAppointment(null); setIsCreating(true); }}><Icon name="plus" size={18} /> New appointment</button>
         </div>
       </header>
@@ -456,7 +537,13 @@ export default function Home() {
           )}
         </section>
 
-        <footer className="page-footer"><span>Planora <span className="footer-dot">·</span> A calmer way to plan.</span><span><Icon name="check" size={13} /> Your changes save automatically in this browser.</span></footer>
+        <footer className="page-footer"><span>Planora <span className="footer-dot">·</span> A calmer way to plan.</span><span><Icon name={cloudStatus === "error" ? "close" : "check"} size={13} />{
+          cloudStatus === "connected" ? " Your appointments are synced with Google Sheets." :
+          cloudStatus === "saving" ? " Syncing your latest changes to Google Sheets…" :
+          cloudStatus === "connecting" ? " Connecting to Google Sheets…" :
+          cloudStatus === "error" ? " Google Sheets sync failed; your browser copy remains saved." :
+          " Saved in this browser only. Connect Google Sheets for cross-device sync."
+        }</span></footer>
       </main>
 
       {notice && <div className="toast" role="status"><span className="toast-check"><Icon name="check" size={15} /></span>{notice}<button onClick={() => setNotice("")} aria-label="Dismiss notification"><Icon name="close" size={15} /></button></div>}
